@@ -1,0 +1,142 @@
+services:
+  # Nessie com Postgres
+  nessie:
+    image: projectnessie/nessie:latest
+    container_name: nessie
+    environment:
+      - QUARKUS_PROFILE=prod
+      - QUARKUS_HTTP_PORT=19120
+      - QUARKUS_LOG_CONSOLE_FORMAT=%d{yyyy-MM-dd HH:mm:ss} %-5p [%c{1.}] (%t) %s%e%n
+      - QUARKUS_LOG_LEVEL=INFO
+      - nessie.version.store.type=jdbc
+      - quarkus.datasource.jdbc.url=jdbc:postgresql://postgres:5432/nessie
+      - quarkus.datasource.username=${DB_USER}
+      - quarkus.datasource.password=${DB_PASSWORD}
+    volumes:
+      - nessie_data:/nessie/data
+    ports:
+      - "19120:19120"
+    networks:
+      - lake
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  # Jupyter & Spark
+  spark:
+    platform: linux/x86_64
+    image: alexmerced/spark35nb:latest
+    ports: 
+      - 8088:8080
+      - 7077:7077
+      - 8081:8081
+      - 4040-4045:4040-4045
+      - 18080:18080
+      - 8888:8888
+    environment:
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - SPARK_MASTER_HOST=spark
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8085
+      - SPARK_WORKER_WEBUI_PORT=8086
+      - SPARK_HISTORY_OPTS=-Dspark.history.fs.logDirectory=/tmp/spark-events
+      - SPARK_HOME=/opt/spark
+    volumes:
+      - ./jupyter:/workspace/seed-data
+    container_name: spark
+    entrypoint: >
+      /bin/bash -c "
+      pip install papermill && \
+      /opt/spark/sbin/start-master.sh && \
+      /opt/spark/sbin/start-worker.sh spark://$(hostname):7077 && \
+      mkdir -p /tmp/spark-events && \
+      start-history-server.sh && \
+      jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token='' --NotebookApp.password='' && \
+      tail -f /dev/null
+      "
+    networks:
+      - lake
+
+  # MinIO
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - MINIO_DOMAIN=storage
+      - MINIO_REGION_NAME=us-east-1
+    networks:
+      - lake
+      - kind
+    ports:
+      - 9001:9001
+      - 9000:9000
+    command: ["server", "/data", "--console-address", ":9001"]
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # Dremio
+  dremio:
+    platform: linux/x86_64
+    image: dremio/dremio-oss:latest
+    container_name: dremio
+    environment:
+      - DREMIO_JAVA_SERVER_EXTRA_OPTS=-Dpaths.dist=file:///opt/dremio/data/dist
+    networks:
+      - lake
+    ports:
+      - 9047:9047
+      - 31010:31010
+      - 32010:32010
+      - 45678:45678
+    depends_on:
+      - nessie
+      - minio
+    volumes:
+      - dremio_data:/opt/dremio/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9047/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    command: >
+      sh -c "apt-get update && apt-get install -y nano && /opt/dremio/bin/dremio start"
+    restart: unless-stopped
+  
+  # Postgres
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    hostname: postgres
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: nessie
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - 5432:5432
+    networks:
+      - lake
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  minio_data:
+  dremio_data:
+  nessie_data:
+
+# Utilize a rede Kind para facilitar a comunicação entre o airbyte e o bucket
+networks:
+  lake:
+  kind:
+    external: true
